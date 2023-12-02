@@ -1,0 +1,668 @@
+---
+title: "Report V2"
+author: "Pritom"
+date: "`r Sys.Date()`"
+output:
+  word_document: default
+  pdf_document: default
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F,message=FALSE,warning=FALSE,dpi=400,comment = "  ")
+
+library(tidyverse)
+library(tidymodels)
+library(themis)
+library(rpart)
+library(party)
+library(magrittr)
+
+temp_met <- 
+  metric_set(accuracy,precision,recall,specificity,sensitivity,roc_auc)
+
+df <- 
+  readxl::read_xlsx("NSCH_2019-2020_Data.xlsx") %>%
+  # remove the missing values of the predictor
+  filter(!K2Q31A %in% c(99,95)) %>% 
+  select(SC_RACE_R:K2Q31A,contains("ACE")) %>% 
+   mutate(
+    SC_RACE_R = factor(SC_RACE_R,c(1, 2, 3, 4, 5, 7),
+                       labels = c("White",
+                                  "Black",
+                                  "American Indian",
+                                  "Asian",
+                                  "Pacific Islander",
+                                  "Two or More Races")), 
+    SC_HISPANIC_R = factor(SC_HISPANIC_R,1:2,labels = c("Hispanic", "Not Hispanic")),
+    SC_SEX = factor(SC_SEX, 1:2,labels = c("Male", "Female")),
+    ACE1 = case_when(ACE1 %in% 1:2 ~ 0,
+                     ACE1 %in% 3:4 ~ 1),
+    K2Q31A = factor(K2Q31A,1:2,c("Yes", "No"))
+    ) %>% 
+  mutate_at(paste0("ACE",3:10),.funs = ~ if_else(.x == 2,0,.x)) %>% 
+  mutate_at(paste0("ACE",3:10),.funs = ~ na_if(.x,99)) %>%
+  rename(ADHD = K2Q31A) %>% 
+  mutate(ACE_total = rowSums(select(.,ACE1:ACE10),na.rm = T),
+         ACE_na = rowSums(is.na(select(.,ACE1:ACE10)))) %>% 
+  select(-c(ACE1:ACE10))  
+```
+
+## Dataset
+This dataset consist a total of 71,835 observations with 18 columns. From those 18 variables we take SC_RACE_R, SC_HISPANIC_R, SC_AGE_YEARS, SC_SEX, ADHD (K2Q31A), ACE1, ACE3, ACE4, ACE5, ACE6, ACE7, ACE8, ACE9 and ACE10 variables.
+
+## Objective
+The main objective of the study is to predict the ADHD as well as determine the variables those are responsible to predict the ADHD levels.
+
+## Response Variable
+```{r}
+df %>% 
+  count(ADHD) %>% 
+  mutate(prop = prop.table(n)) %>% 
+  pander::pander()
+```
+
+Here we can see that almost 89.8% of the child do not have the ADHD. So this is a highly imbalanced dataset. When we apply algorithm to this data set we can not apply the performance metric such as accuracy. Rather we will use the metric like kappa, roc_auc since those are robust on the effect of the class imbalance.
+
+\newpage
+## Predictor Variables
+There are 9 ACE type questions which were asked to retrieve information about.
+```{r}
+readxl::read_xlsx("NSCH_2019-2020_Data.xlsx") %>%
+  head() %>% 
+  select(ACE1:ACE10) %>% 
+  pander::pander()
+```
+
+Where
+
+  - 1 is encoded as Yes.
+  - 2 is encoded as No.
+  
+But we want to re-encode it as 
+
+  - 0 is encoded as No.
+  - 1 is encoded as Yes.
+  
+After doing that our new observations would be:
+```{r}
+read_rds("NSCH_2019-2020_Data_uncollaps.rds") %>% 
+  head() %>% 
+  select(ACE1:ACE10) %>% 
+  pander::pander()
+```
+
+After doing the factor encoding and creating two new features ACE_total (calculate the total number of yes in the ACE question) and ACE_na (calculate the total number of missing in the ACE question) the dataset become,
+```{r}
+read_rds("NSCH_2019-2020_Data_uncollaps.rds") %>% 
+  head() %>% 
+  select(ACE1:ACE_na) %>% 
+  mutate_at(1:9,~factor(.x,0:1,c("No","Yes"))) %>% 
+  pander::pander()
+```
+
+Here, one noticeable thing would be initially ACE1 variable had four labels which were converted to two labels.
+
+\newpage
+## Descriptive Statistics
+This table presents the percentages of events for each category within the predictor categorical variables. The variable SC_HISPANIC_R comprises 2 categories. The category with the highest frequency within the SC_HISPANIC_R variable is labeled as "Not Hispanic" (87.1%), while the category with the lowest frequency is labeled as "Hispanic" (12.9%). Similarly, the variable SC_RACE_R encompasses 2 categories, with the highest frequency occurring within the "White" category (77.4%), and the lowest frequency within the "Pacific Islander" category (0.7%). Likewise, the variable SC_SEX consists of 2 categories, with the highest frequency observed in the "Male" category (51.8%), and the lowest frequency in the "Female" category (48.2%).
+
+```{r}
+df %>% 
+  select(where(is.factor),-ADHD) %>% 
+  pivot_longer(everything()) %>% 
+  count(name,value) %>% 
+  group_by(name) %>% 
+  mutate(prop = n/sum(n),
+         prop = scales::percent(prop,accuracy = .1)) %>% 
+  arrange(name,-n) %>% 
+  rename(variables = name,
+         event = value,
+         count = n) %>% 
+  pander::pander()
+```
+
+
+This table below show us the mean and standard deviation for the numeric predictor variables. The variable ACE_total has mean 0.762 and sd 1.266. For the variable SC_AGE_YEARS has mean 9.467 and sd 5.183.
+```{r}
+df %>% 
+  select(SC_AGE_YEARS,ACE_total) %>% 
+  pivot_longer(everything()) %>% 
+  group_by(name) %>% 
+  summarise(mean = mean(value),sd = sd(value)) %>% 
+  rename(variable = name) %>% 
+  pander::pander()
+```
+
+\newpage
+
+This plot below is a visual representation of the table for showing the distribution of the categorical variables.
+```{r}
+df %>% 
+  select_if(is.factor) %>%
+  pivot_longer(everything()) %>% 
+  count(name,value) %>% 
+  group_by(name) %>% 
+  mutate(prop = n/sum(n),
+         prop = round(prop,3),
+         value = str_wrap(value,15)) %>% 
+  ggplot(aes(value,n)) +
+  geom_col(fill = "lightgreen", col = "darkgreen") +
+  geom_text(aes(y = n+5e3, label = prop)) +
+  facet_wrap(~name, scales = "free_x") +
+  scale_y_continuous(labels = scales::number_format(suffix = "k",scale = .001)) +
+  theme(axis.text.x = element_text(size = 7)) +
+  labs(title = "Barplot for shoing the distribution of categorical variables",
+       x = "",y = "")
+```
+
+\newpage
+## New Features
+This plot is showing the distribution of the newly created features. The ACE answers for 94.2% of the observations are not missing. So it will be safe to omit the observations for which there are at least one missing ACE values. The value of total number of ACE is zero for 62.8% of the observations.
+```{r}
+df %>% 
+  select(ACE_total,ACE_na) %>% 
+  pivot_longer(everything()) %>% 
+  count(name,value) %>% 
+  group_by(name) %>% 
+  mutate(prop = n/sum(n),
+         prop = round(prop,3),
+         value = as.factor(value)) %>% 
+  ggplot(aes(value,n)) +
+  geom_col(fill = "lightgreen", col = "darkgreen") +
+  geom_text(aes(y = n+5e3, label = prop), size = 3,angle = 90) +
+  facet_wrap(~name, scales = "free_x",ncol = 2) +
+  theme(axis.text.y = element_text(hjust = .5,size = 7)) +
+  labs(title = "Barplot for showing the distribution of ACE variables",
+       x = "",y = "") 
+```
+
+\newpage
+## Pattern in the missing observations
+From this plot below we can safely assume that the missing values are occur at random. The age distribution for the individuals having ADHA is approximately same as the The age distribution for the individuals not having ADHA. That is P(Missing number of ACE answers = i|ADHD)=P(Missing number of ACE answers = i). Since the missing value occar at random we may omit them from the rest of the analysis part.
+```{r}
+df %>% 
+  transmute(ADHD,ACE_na = as_factor(ACE_na)) %>% 
+  count(ADHD,ACE_na) %>% 
+  group_by(ADHD) %>%
+  mutate(prop = prop.table(n)) %>% 
+  ggplot(aes(ACE_na,prop, fill = ADHD, label = paste0(round(n/1e3,2),"k"))) +
+  geom_col(position = "dodge") + 
+  geom_text(aes(y = prop+.05), size = 2.5,angle = 90,position = position_dodge(width = 1),hjust = 0) +
+  geom_text(aes(y = prop + .01,label = round(100*prop,1)),position = position_dodge(width = 1),vjust = 0, size = 3) +
+  scale_y_continuous(limits = c(0,1.05),labels = scales::percent_format()) +
+  theme(legend.position = c(.8,.8)) +
+  labs(title = "Distribution of the number of complete values with respect to ADHD labels",
+       y = "percentage",
+       x = "total number of missing values of ACE")
+```
+
+\newpage
+## Effect of omitting missing values 
+From this plot we can see that, the age distribution is approximately uniform for all the individuals do not have ADHD. On the other hand, the age distribution is skewed for all the individuals having ADHD. We may conclude that, the tendency of diagnostic as ADHD is lower at the younger age. Here the black dotted line represent the distribution of the age before the omitting the observations for which atleast one ACE's were missing.
+
+```{r}
+df %>% 
+  filter(ACE_na == 0) %>% 
+  select(ADHD,SC_AGE_YEARS) %>% 
+  count(ADHD,SC_AGE_YEARS) %>% 
+  group_by(ADHD) %>% 
+  mutate(prop = n/sum(n)) %>% 
+  
+  {.->>x} %>%               # creating label for the text label
+  left_join(
+    x %>%
+      select(-n) %>%
+      pivot_wider(names_from = ADHD, values_from = prop) %>%
+      mutate(Yes = if_else(Yes < No, Yes - .008, Yes + .008),
+             No = if_else(No < Yes, No - .008, No + .008)) %>%
+      pivot_longer(-SC_AGE_YEARS, names_to = "ADHD", values_to = "y_lab"),
+    c("ADHD", "SC_AGE_YEARS")
+  ) %>%                     # end of the section creating label for the text label
+  
+  ggplot(aes(SC_AGE_YEARS,prop,col=ADHD,.group = ADHD, label = n)) +
+  
+  # drawing the black line
+  geom_line(data = df %>% 
+              select(ADHD, SC_AGE_YEARS) %>%
+              count(ADHD, SC_AGE_YEARS) %>%
+              group_by(ADHD) %>%
+              mutate(prop = n / sum(n)), col = "black", alpha = .8,linetype = "dashed"
+      ) +
+  geom_point(alpha = .7) +
+  geom_line(alpha = .7) +
+  geom_text(aes(y = y_lab),size = 3, angle = 90, show.legend = F) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_x_continuous(breaks = scales::breaks_width(2)) +
+  labs(title = "Distribution of age group given ADHD") 
+```
+
+Till now we see try to figure out the distribution of the features given that a person having ADHD or not. From the now we will try to see the distribution of ADHD labels given the value of different features.
+
+
+
+
+\newpage
+# Variable Importance
+
+## Probability of having ADHD given categorical response
+Here we can see that the probability of diagnostic as having ADHD is lower given that race is Asian. Among the male individuals the tendency of having ADHD is more.
+
+```{r}
+df %>% 
+  select_if(is.factor) %>% 
+  pivot_longer(-ADHD) %>% 
+  count(ADHD,name,value) %>% 
+  group_by(name,value) %>% 
+  mutate(prop = prop.table(n),
+         prop = round(prop,3),
+         value = str_wrap(value,12),
+         n_size = sum(n)) %>% 
+  filter(ADHD == "Yes") %>% 
+  ggplot(aes(value,prop,label = prop)) +
+  geom_col(col = "darkblue", fill = "lightblue") +
+  geom_hline(yintercept = prop.table(table(df$ADHD))[1], alpha = .5,linetype = 2) +
+  geom_text(show.legend = F, nudge_y = .01) +
+  geom_text(aes(y = .01,label = n_size)) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  facet_wrap(~name,ncol = 2, scales = "free_x") +
+  theme(axis.text.x = element_text(size = 7)) +
+  labs(title = "P(ADHA=Yes|different variable labels)",
+       subtitle = "Baseline probability P(ADHD=Yes)=0.102",
+       x = "",
+       y = "Percentage")
+```
+
+\newpage
+## Probability of having ADHD given numeric response
+From this plot we can see that as the number of ACE_total increases the P(ADHD=Yes|ACE_total) also increases. Same trend can be observed for the age variables after the age of 7.
+
+```{r}
+df %>% 
+  select(ADHD,SC_AGE_YEARS,ACE_total) %>% 
+  pivot_longer(-ADHD) %>% 
+  count(ADHD,name,value) %>% 
+  group_by(name,value) %>% 
+  mutate(prop = prop.table(n),
+         prop = round(prop,3),
+         n_size = sum(n),
+         value = as.factor(value),
+         nudge_y = if_else(name == "ACE_total",prop+.05,prop+.015)) %>% 
+  filter(ADHD == "Yes") %>% 
+  ggplot(aes(value,prop,label = prop)) +
+  geom_point(alpha = .5) +
+  geom_hline(yintercept = prop.table(table(df$ADHD))[1], alpha = .5,linetype = 2) +
+  geom_line(aes(group = name), alpha = .3) +
+  geom_text(aes(y=nudge_y),size = 2.5,col = "blue") +
+  geom_label(aes(y = -.01,label = n_size),size = 2,label.padding = unit(.7,units = "mm"), fill = "white") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  facet_wrap(~name,ncol = 1, scales = "free") +
+  theme(axis.text.x = element_text(size = 7)) +
+  labs(title = "P(ADHA=Yes|different variable labels)",
+       subtitle = "Baseline probability P(ADHD=Yes)=0.102",
+       x = "",
+       y = "Percentage")
+```
+
+
+```{r}
+df %<>% 
+  filter(ACE_na == 0) %>% 
+  select(-ACE_na)
+```
+
+\newpage
+## Train Test Split
+Since we are using models like decision tree and conditional inference tree which are prone to overfitting, we are keeping separate some of the data points those will no be included on the training process. We kept 80% observations for the training process and 20% observations for the testing procedure. This table below show the distribution of ADHD for the training and testing dataset. The training set contains 54133 observation and the testing set contains 13535 observations. In both the training and testing set the distribution of ADHD variable is safe to assume to be identical. We are using a seed value to split the data into training and testing so that the result become reproducable. 
+
+```{r}
+set.seed(1234)
+df_split <- initial_split(df,prop = .8,strata = ADHD)
+bind_rows(select(testing(df_split),ADHD) %>% mutate(label = "test"),
+          select(training(df_split),ADHD) %>% mutate(label = "train")) %>% 
+  count(label,ADHD) %>% 
+  group_by(label) %>% 
+  mutate(prop = prop.table(n),
+         sample_size = sum(n)) %>% 
+  pander::pander()
+```
+
+## Distribution of the Testing Dataset
+The testing set contains 13535 observation. The table below represents the distribution of the categorical variables. The percentage are fluctuated a little due to the selection bias but more or less they are the same.
+```{r}
+testing(df_split) %>% 
+  select_if(is.factor) %>% 
+  pivot_longer(everything()) %>% 
+  count(name,value) %>% 
+  group_by(name) %>% 
+  mutate(prop = n/sum(n),
+         prop = scales::percent(prop,accuracy = .1)) %>% 
+  rename(variables = name,
+         event = value,
+         count = n) %>% 
+  pander::pander()
+```
+
+This table below shows the mean and the sd for the numeric variables in the training set. The mean and sd has almost no changes.
+```{r}
+testing(df_split) %>% 
+  select(SC_AGE_YEARS,ACE_total) %>% 
+  pivot_longer(everything()) %>% 
+  group_by(name) %>% 
+  summarise(mean = mean(value),sd = sd(value)) %>% 
+  rename(variable = name) %>% 
+  pander::pander()
+```
+
+\newpage
+## Class Imbalance
+As we can see the train dataset contains 10.18% of cases for whom ADHD is Yes and 89.82% of cases for whom ADHD is No. We can call the ADHD Yes as minority class on the other hand the ADHD No majority class. If the proportion of the minority class and majority class significantly differ the problem refers as class imbalance problem. If the class imbalance problem exist then there become a tendency for the Machine Learning algorithm to always predict the majority class. In that case there are some techniques which are useful to deal with this problem. 
+
+In this project to deal with the class imbalance we will apply SMOTE algorithm to the minority class (ADHD No). We will use over ration equals one. That is the total number of the minority class will match the total number of the majority class in the training set. Extra synthetic samples were generated from the existing minority class using SMOTE algorithm. Before applying the SMOTE-NC algorithm there were 5512 training example in the minority class. After applying the SMOTE-NC, the minority class will match the total number of observation of the majority class (48621) which will consist in total 97242 observations in the training data.
+
+
+## Metric
+There are several metric which can be used to evaluate performance of the machine learning models. The metric are selected on the objective of the model. We will calculate the sensitivity, specificity, precision, recall, accuracy, balanced accuracy and area under the roc curve. Those metrics are defined as
+
+  - Sensitivity = A/(A+C)
+  - Specificity = D/(B+D)
+  - Precision = A/(A+B)
+  - Recall = A/(A+C)
+  - Accuracy = (A+C)/(A+B+C+D)
+  - Balanced Accuracy = (sensitivity+specificity)/2
+
+Where,
+
++----------+---+--+
+|          |Truth |
++----------+---+--+
+|Prediction|Yes|No|
++----------+---+--+
+|Yes       |A  |B |
++----------+---+--+
+|Yes       |C  |D |
++----------+---+--+
+
+
+```{r}
+df_train <-
+  recipe(training(df_split),ADHD ~ .) %>% 
+  step_smotenc(ADHD,seed = 1234) %>% 
+  prep() %>% 
+  juice()
+```
+
+
+\newpage
+## Distribution in Training
+This table illustrates the distribution of categorical variables in the training example following the application of the SMOTE algorithm. It is evident that both the ADHD "Yes" and "No" classes exhibit similar percentages. The proportions of the categories within the predictor variables are generally consistent, except for the SC_SEX (Male) group. This discrepancy can be attributed to the association between SC_SEX (Male) and the ADHD "Yes" group. As synthetic samples were generated from the ADHD "Yes" group, the percentage values of all associated levels increased accordingly.
+
+```{r}
+df_train %>% 
+  select_if(is.factor) %>% 
+  pivot_longer(everything()) %>% 
+  count(name,value) %>% 
+  group_by(name) %>% 
+  mutate(prop = n/sum(n),
+         prop = scales::percent(prop,accuracy = .1)) %>% 
+  arrange(name,-n) %>% 
+  rename(variables = name,
+         event = value,
+         count = n) %>% 
+  pander::pander()
+```
+
+
+
+This table below shows the mean and the sd of the numeric variables. We can see an increase in both of the numeric variables. This is due to the same effect discussed above which is a higher than the average values were associated with the minority class (ADHA Yes). Due to the increase in the minority sample (synthetic) the variabes which are associated with it also changes.
+```{r}
+df_train %>% 
+  select(SC_AGE_YEARS,ACE_total) %>% 
+  pivot_longer(everything()) %>% 
+  group_by(name) %>% 
+  summarise(mean = mean(value),sd = sd(value)) %>% 
+  rename(variable = name) %>% 
+  pander::pander()
+```
+
+\newpage
+# Logistic regression
+## Summary Table with p.value
+Logistic regression is one of the most classic algorithm. In logistic regression the log of odds of the ADHD Yes has been tried to model using the linear combination of the features. The categorical variables were decomposed using one hot encoding. Though the logistic regression is not very well for the prediction capabilities the model can provide a great interpretation for the predictor variables. The table below is showing the output of the logistic regression. We can see that all of the variables are significant to the model at 1% level of significant since the p-value for the all of the variables are less that 0.01. The odds of having ADHD(Yes) will increase on average by $e^{0.290478}$ = 1.337066 times for an "Not Hispanic" than the Hispanic individuals. Similarly for the individuals who belongs to the race Black, American Indian, Asian, Pacific Islander and Two or More Races the odds of having ADHD will decrease by 0.946, 0.681, 0.335, 0.710 and 0.913 times compare to the individuals belong to race white. The odds of having ADHD for female is 0.437 times lower than the boys group. For 1 unit increase in the age or ACE_Total variable the odds of having ADHD increase by 1.159 and 1.414 times respectively.
+
+```{r}
+lr_fit <- 
+  glm(formula = ADHD ~ .,family = "binomial",data = mutate(df_train,ADHD = relevel(ADHD,"No")) )
+
+x <- 
+  lr_fit %>% 
+  summary() %T>% 
+  print()
+```
+
+\newpage
+## Confidence interval
+Table for showing the 95% CI for the intercept of the logistic regression. As we previously seen that the p.value for all of the variables are significant, the 95% CI does not contains the value zero for any of the CI.
+```{r}
+cbind(x$coefficients[,1],confint.default(lr_fit)) %>% 
+  as.data.frame() %>% 
+  rownames_to_column() %>% 
+  rename(variables = rowname,intercept=V1) %>% 
+  pander::pander()
+```
+
+## Confusion Matrix 
+This matrix show the table for the true and the predicted value. Among the observations 984 and 8104 observations were classified as Yes and No correctly.
+```{r}
+testing(df_split) %>% 
+  select(ADHD) %>% 
+  mutate(.pred_Yes = predict(object = lr_fit,testing(df_split),type = "response"),
+         .pred_class = if_else(.pred_Yes>.5,"Yes","No"),
+         .pred_class = factor(.pred_class,levels(ADHD))) %>% 
+  conf_mat(truth = ADHD,.pred_class)
+```
+
+## Performance Metric
+The table below show us the performance metrics which are calculated from the confusion matrix. 
+```{r}
+testing(df_split) %>% 
+  select(ADHD) %>% 
+  mutate(.pred_Yes = predict(object = lr_fit,testing(df_split),type = "response"),
+         .pred_class = if_else(.pred_Yes>.5,"Yes","No"),
+         .pred_class = factor(.pred_class,levels(ADHD))) %>% 
+  temp_met(truth = ADHD,estimate = .pred_class,.pred_Yes) %>% 
+  pander::pander()
+```
+
+
+
+
+
+\newpage
+## Decision Tree
+Decision tree is another algorithm which provide a higher prediction performance if it correctly trained. There are many parameters related to decision tree model which can ton be optimized from the data, are refers to the hyperparameters. Among all the hyperparameters we are going to talk about:
+
+  - minsplit : The minimum number of observations that must exist in a node in order for a split to be attempted.
+  - CP (cost complexity) : The main role of this parameter is to save computing time by pruning off splits that are obviously not worthwhile. 
+  - maxdepth: Set the maximum depth of any node of the final tree.
+  
+In this project we are using the default value of the algorithm set by rpart. The value of minsplit, cp and maxdepth are 20, 0.01 and 30.
+
+
+## Figure for the Decision Tree
+This figure show us that the age, ACE total, sex and race are the most important variable respectively.
+```{r}
+tree_fit <- rpart(formula = ADHD ~ .,data = df_train,control = rpart.control())
+rpart.plot::prp(tree_fit,type = 1,extra = 3)
+```
+
+\newpage
+## Confusion Matrix 
+This matrix show the table for the true and the predicted value. Among the observations 1085 and 7538 observations were classified as Yes and No correctly.
+
+```{r}
+testing(df_split) %>% 
+  select(ADHD) %>% 
+  mutate(.pred_Yes = predict(tree_fit,testing(df_split))[,1],
+         .pred_class = if_else(.pred_Yes>.5,"Yes","No"),
+         .pred_class = factor(.pred_class,levels(ADHD))) %>% 
+  conf_mat(truth = ADHD,.pred_class)
+```
+
+
+## Performance Metric
+The table below show us the performance metrics which are calculated from the confusion matrix. Since we used the default value of hyper-parameter setting it was quite obvious that the performance of the model wont be that perfect. However, with the random setting of the hyper-parameter provide descent performance of the model compare to the logistic regression model. The roc_auc is close to logistic regression model.
+```{r}
+testing(df_split) %>% 
+  select(ADHD) %>% 
+  mutate(.pred_Yes = predict(tree_fit,testing(df_split))[,1],
+         .pred_class = if_else(.pred_Yes>.5,"Yes","No"),
+         .pred_class = factor(.pred_class,levels(ADHD))) %>% 
+  temp_met(truth = ADHD,estimate = .pred_class,.pred_Yes) %>% 
+  pander::pander()
+```
+
+
+
+
+
+\newpage
+## Conditional Inferance Tree
+Unlike the decision tree where the gini impurity measure is usually use to make the spiting decision, conditional inference trees employ statistical tests such as the chi-squared test or permutation tests to evaluate the quality of splits. The primary advantage of using conditional inference trees is that they provide a principled and statistically rigorous framework for building decision trees. By incorporating statistical tests, these trees can handle both categorical and continuous predictor variables and account for potential interactions among variables. Additionally, they are less prone to overfitting compared to traditional decision trees. There are also several hyperparameters associated with the model. Since the conditional inference tree is not prone to the overfitting compare to the decision tree model we may use the default parameters.
+
+## Tree Visualization
+The depth of the tree is very large the whole tree is not possible to plot. We are only plotting the depth of 3.
+```{r}
+ctree_fit <- ctree(formula = ADHD ~ .,data = df_train,controls = ctree_control())
+plot(ctree(formula = ADHD ~ .,data = df_train,controls = ctree_control(maxdepth = 3)),type = "simple")
+```
+
+## Confusion Matrix 
+This matrix show the table for the true and the predicted value. Among the observations 1016 and 8208 observations were classified as Yes and No correctly.
+```{r}
+temp_pred <- c()
+for(i in predict(ctree_fit,testing(df_split),type = "prob")){
+  temp_pred <- c(temp_pred,i[1])
+}
+
+testing(df_split) %>% 
+  select(ADHD) %>% 
+  mutate(.pred_Yes = temp_pred,
+         .pred_class = if_else(.pred_Yes>.5,"Yes","No"),
+         .pred_class = factor(.pred_class,levels(ADHD))) %>% 
+  conf_mat(ADHD,.pred_class)
+```
+
+
+## Performance Metrix
+The table below show us the performance metrics which are calculated from the confusion matrix. Since we used the default value of hyper-parameter setting it was quite obvious that the performance of the model wont be that perfect. However, with the random setting of the hyper-parameter provide descent performance of the model compare to the logistic regression model. The roc_auc is close to logistic regression model.
+```{r}
+testing(df_split) %>% 
+  select(ADHD) %>% 
+  mutate(.pred_Yes = temp_pred,
+         .pred_class = if_else(.pred_Yes>.5,"Yes","No"),
+         .pred_class = factor(.pred_class,levels(ADHD))) %>% 
+  temp_met(truth = ADHD,estimate = .pred_class,.pred_Yes) %>% 
+  pander::pander()
+```
+
+
+\newpage
+# Decision Tree
+##  CP = 0.001
+There are many related hyper-parameter among them we are only working with cost complexity parameter. Which are directly related to the pruning. 
+
+```{r}
+tree_fit <- rpart(formula = ADHD ~ .,data = df_train,control = rpart.control(cp = .001))
+rpart.plot::prp(tree_fit,type = 1,extra = 3)
+```
+
+evaluation for the tree
+```{r}
+testing(df_split) %>% 
+  select(ADHD) %>% 
+  mutate(.pred_Yes = predict(tree_fit,testing(df_split))[,1],
+         .pred_class = if_else(.pred_Yes>.5,"Yes","No"),
+         .pred_class = factor(.pred_class,levels(ADHD))) %>% 
+  temp_met(truth = ADHD,estimate = .pred_class,.pred_Yes) %>% 
+  pander::pander()
+```
+
+\newpage
+## CP = 0.0005.
+```{r}
+tree_fit <- rpart(formula = ADHD ~ .,data = df_train,control = rpart.control(cp = .0005))
+rpart.plot::prp(tree_fit,type = 1,extra = 3)
+```
+
+evaluation for the tree
+
+```{r}
+testing(df_split) %>% 
+  select(ADHD) %>% 
+  mutate(.pred_Yes = predict(tree_fit,testing(df_split))[,1],
+         .pred_class = if_else(.pred_Yes>.5,"Yes","No"),
+         .pred_class = factor(.pred_class,levels(ADHD))) %>% 
+  temp_met(truth = ADHD,estimate = .pred_class,.pred_Yes) %>% 
+  pander::pander()
+```
+
+
+\newpage
+# Conditioanl Inferance Tree
+## Max Depth = 5
+```{r}
+ctree_fit <- ctree(formula = ADHD ~ .,data = df_train,controls = ctree_control(maxdepth = 5))
+plot(ctree(formula = ADHD ~ .,data = df_train,controls = ctree_control(maxdepth = 3)),type = "simple")
+```
+
+evaluation for the conditional tree
+```{r}
+temp_pred <- c()
+for(i in predict(ctree_fit,testing(df_split),type = "prob")){
+  temp_pred <- c(temp_pred,i[1])
+}
+
+testing(df_split) %>% 
+  select(ADHD) %>% 
+  mutate(.pred_Yes = temp_pred,
+         .pred_class = if_else(.pred_Yes>.5,"Yes","No"),
+         .pred_class = factor(.pred_class,levels(ADHD))) %>% 
+  temp_met(truth = ADHD,estimate = .pred_class,.pred_Yes) %>% 
+  pander::pander()
+```
+
+# Conditioanl Inferance Tree
+## Max Depth = 7
+```{r}
+ctree_fit <- ctree(formula = ADHD ~ .,data = df_train,controls = ctree_control(maxdepth = 7))
+plot(ctree(formula = ADHD ~ .,data = df_train,controls = ctree_control(maxdepth = 3)),type = "simple")
+```
+
+evaluation for the conditional tree
+```{r}
+temp_pred <- c()
+for(i in predict(ctree_fit,testing(df_split),type = "prob")){
+  temp_pred <- c(temp_pred,i[1])
+}
+
+testing(df_split) %>% 
+  select(ADHD) %>% 
+  mutate(.pred_Yes = temp_pred,
+         .pred_class = if_else(.pred_Yes>.5,"Yes","No"),
+         .pred_class = factor(.pred_class,levels(ADHD))) %>% 
+  temp_met(truth = ADHD,estimate = .pred_class,.pred_Yes) %>% 
+  pander::pander()
+```
+
+
+
+
+
+
+
+
+
+
+
